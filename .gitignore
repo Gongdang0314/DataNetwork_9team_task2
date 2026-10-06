@@ -1,6 +1,5 @@
 # Project-specific
 *.pdf
-logs/
 .claude/
 
 # Byte-compiled / optimized / DLL files

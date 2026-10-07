@@ -20,6 +20,23 @@ Python 3.10 이상. 별도 pip 패키지 필요 없음. Windows 로컬 + Linux �
 wall-clock 로그: [HH:MM:SS.mmm] NODE | EVENT | STATUS | JSON payload
 기간 측정은 각 노드의 time.perf_counter()를 사용한다. 서로 다른 노드 시각을 빼지 않는다.
 
+AWS 서버와 로컬 PC의 시간 처리 (HW2description 2/14쪽, HW2explanation 9쪽):
+- AWS 운영체제의 시간대가 UTC여도 logger가 명시적으로 KST로 변환하므로 양쪽 로그는 KST다.
+- 응답시간은 로컬 Client의 요청 전송 직전~첫 응답 수신까지 같은 Client 시계로 측정한다.
+  여기에는 AWS까지의 네트워크 왕복 및 서버 처리 시간이 포함된다.
+- Throughput 분모는 AWS Server의 첫 연결~마지막 첫 응답 전송 기간이다.
+  두 끝점 모두 동일 Server 프로세스의 perf_counter를 사용한다.
+- Waitlist 평균은 AWS Server의 대기 등록~NOTIFY 전송 완료 기간이며 미해결 대기는 제외한다.
+- 서버 로그 시각에서 클라이언트 로그 시각을 빼거나 서로 다른 호스트의 perf_counter 값을
+  빼지 않는다. 시계 원점이 다를 수 있으므로 각 Client에서 계산한 기간만 서버로 전달한다.
+- NTP 동기화는 로그 비교를 위한 권장 사항이며 과제 필수 조건은 아니다.
+  실행 전 Windows의 자동 시간 설정과 AWS의 시간 동기화 상태를 확인한다.
+  chrony를 사용하는 EC2 Linux: chronyc sources -v / chronyc tracking
+  로컬 Windows: w32tm /query /status (진단용; 서비스 설정은 자동 변경하지 않는다).
+  EC2의 169.254.169.123은 인스턴스 전용 시간 서버 주소이므로 로컬 PC에 설정하지 않는다.
+  OS별 AWS 안내: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html
+  설정을 바꾸거나 NTP가 시간을 보정해도 성능 측정에는 wall-clock을 사용하지 않는다.
+
 src/server/main.py      실행, 5초 POOL 관찰, 완료/장애 감시, 종료 및 정합성 확인
 src/server/listener.py  selectors 기반 단일 Listener, TCP 파싱, 큐 적재, 송신
 src/server/worker.py    서버 시작 때 만든 Worker 10개, 예약/취소 처리
@@ -210,6 +227,9 @@ Graceful 정상 종료의 확인은 각 Client의 BYE 수신 로그 + 서버의 
 로그 I/O가 임계구역 밖에 있어 줄 순서는 달라질 수 있으므로 version을 기준으로 한다.
 실제 요청/응답 ID 집합, 원자적 다중 배정, 오름차순 LOCK, FIFO ticket/handoff,
 서버/Client 통지 내용, 최종 snapshot 및 배정/해제 수지를 확인한다.
+단일 RESERVE/CANCEL도 요청별 성공·실패와 실제 전이를 대조한다. SUCCESS는 해당 요청의
+전이와 응답 좌석 상태가 일치해야 하고, FAIL에는 전이/대기 등록이 없어야 한다.
+WAITLISTED는 대기 등록 1개와 대응하며, 응답의 좌석 버전·소유자도 이력과 대조한다.
 --submission은 30x5000, 클라이언트 설정 간격 0.2~1.0도 확인한다.
 원격 배포 사실은 이 도구만으로 증명하지 못하므로 배포 설명/영상으로 함께 확인한다.
 

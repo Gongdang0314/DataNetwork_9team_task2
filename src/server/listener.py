@@ -12,7 +12,8 @@ from src.common.protocol import (COMMANDS, Decoder, PROTOCOL_VERSION, RECV_BUF,
 @dataclass
 class Connection:
     sock: socket.socket
-    accepted: float = field(default_factory=time.monotonic)
+    # Use the same server-local clock as RunState.responded, including on Windows.
+    accepted: float = field(default_factory=time.perf_counter)
     decoder: Decoder = field(default_factory=Decoder)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
     cid: int | None = None

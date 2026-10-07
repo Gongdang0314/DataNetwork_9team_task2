@@ -3,6 +3,7 @@ import argparse
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
+from src.common.protocol import COMMANDS, NUM_SEATS, integer
 from src.server.verification import verify_final
 
 
@@ -28,6 +29,7 @@ def verify(folder, submission=False):
     if submission and (cid_count, request_count) != (30, 5000):
         errors.append("submission requires 30 x 5000")
     responses, notify, transitions, registrations, locks = {}, {}, defaultdict(list), defaultdict(list), {}
+    request_changes, request_waits = defaultdict(list), defaultdict(list)
     server_snapshot = None
     final_metrics = None
     closed = False
@@ -44,8 +46,10 @@ def verify(folder, submission=False):
             notify[key] = data
         if data.get("phase") == "transition":
             transitions[data["seat"]].append(data)
+            request_changes[(data["cid"], data["rid"])].append(data)
         if event == "WAITLIST" and level == "SUCCESS":
             registrations[data["seat"]].append(data)
+            request_waits[(data["cid"], data["rid"])].append(data)
         if event == "LOCK":
             locks[(data["cid"], data["rid"])] = data["order"]
             if data["order"] != sorted(set(data["order"])):
@@ -137,9 +141,10 @@ def verify(folder, submission=False):
         errors.append("server/client notification coverage")
     # Replay each seat's complete ownership history in version order. Log writes
     # occur outside locks, so file order alone is deliberately not used.
-    grouped_multi = defaultdict(set)
+    owner_history = {}
     for number in range(1, 101):
         owner, version, assigned, released = None, 0, 0, 0
+        owner_history[number] = {0: None}
         waits = sorted(registrations[number], key=lambda x: x["ticket"])
         if [w["ticket"] for w in waits] != list(range(1, len(waits) + 1)):
             errors.append(f"seat {number}: wait ticket sequence")
@@ -157,9 +162,9 @@ def verify(folder, submission=False):
                     errors.append(f"seat {number}: cancellation by non-owner")
             elif owner is not None or event["after"] != event["cid"]:
                 errors.append(f"seat {number}: double booking")
-            if cmd == "RESERVE_MULTI":
-                grouped_multi[(event["cid"], event["rid"])].add(number)
             if "wait_ticket" in event:
+                if cmd != "CANCEL" or event["after"] != event["wait_cid"]:
+                    errors.append(f"seat {number}: invalid waitlist handoff")
                 if handoffs >= len(waits):
                     errors.append(f"seat {number}: unregistered handoff")
                 else:
@@ -170,9 +175,12 @@ def verify(folder, submission=False):
                     if note.get("state") != dict(seat=number, version=version, owner=event["after"]):
                         errors.append(f"seat {number}: missing handoff notification")
                 handoffs += 1
+            elif cmd == "CANCEL" and event["after"] is not None:
+                errors.append(f"seat {number}: cancellation assigned an unregistered owner")
             if owner is not None:
                 released += 1
             owner = event["after"]
+            owner_history[number][version] = owner
             if owner is not None:
                 assigned += 1
         expected_pending = [dict(cid=w["cid"], rid=w["rid"], ticket=w["ticket"]) for w in waits[handoffs:]]
@@ -180,16 +188,69 @@ def verify(folder, submission=False):
         if (last["owner"], last["version"], last["assigned"], last["released"], last["waitlist"]) != (
                 owner, version, assigned, released, expected_pending):
             errors.append(f"seat {number}: final state differs from replay")
+    if (set(request_changes) | set(request_waits)) - set(responses):
+        errors.append("state change/waitlist registration without a response")
     for key, response in responses.items():
         request = all_client_requests.get(key, {})
-        if request.get("cmd") == "RESERVE_MULTI":
-            expected = set(request["seats"]) if response["status"] == "SUCCESS" else set()
-            if grouped_multi[key] != expected:
+        cmd, numbers, status = request.get("cmd"), request.get("seats"), response["status"]
+        changes, waits = request_changes[key], request_waits[key]
+        valid = (cmd in COMMANDS and isinstance(numbers, list)
+                 and all(integer(n, 1, NUM_SEATS) for n in numbers)
+                 and len(set(numbers)) == len(numbers)
+                 and (2 <= len(numbers) <= 4 if cmd == "RESERVE_MULTI" else len(numbers) == 1))
+        if not valid:
+            if status != "FAIL" or response.get("states") != [] or changes or waits:
+                errors.append(f"{key}: invalid request changed state or did not fail")
+            continue
+
+        states = response.get("states")
+        expected_seats = sorted(numbers)
+        states_valid = (isinstance(states, list) and all(isinstance(s, dict) for s in states)
+                        and [s.get("seat") for s in states] == expected_seats)
+        if not states_valid:
+            errors.append(f"{key}: response states do not match requested seats")
+        else:
+            for state in states:
+                history = owner_history[state["seat"]]
+                version = state.get("version")
+                if (not integer(version, 0) or version not in history
+                        or state.get("owner") != history[version]):
+                    errors.append(f"{key}: response state differs from ownership history")
+
+        if status == "SUCCESS":
+            if (len(changes) != len(numbers)
+                    or sorted(change["seat"] for change in changes) != expected_seats):
+                errors.append(f"{key}: {cmd} SUCCESS does not match state transitions")
+            for change in changes:
+                if cmd == "CANCEL":
+                    valid_change = change["before"] == key[0] and change["after"] != key[0]
+                else:
+                    valid_change = change["before"] is None and change["after"] == key[0]
+                if not valid_change:
+                    errors.append(f"{key}: invalid {cmd} SUCCESS transition")
+            expected_states = [dict(seat=c["seat"], version=c["version"], owner=c["after"])
+                               for c in sorted(changes, key=lambda c: c["seat"])]
+            if states != expected_states:
+                errors.append(f"{key}: SUCCESS response does not match its transitions")
+            if waits:
+                errors.append(f"{key}: SUCCESS registered a waitlist entry")
+        elif status == "FAIL":
+            if changes or waits:
+                errors.append(f"{key}: FAIL changed state or registered a waitlist entry")
+        elif status == "WAITLISTED":
+            if (cmd != "RESERVE" or changes or len(waits) != 1
+                    or waits[0]["seat"] != numbers[0]):
+                errors.append(f"{key}: WAITLISTED does not match one registration")
+            if states_valid and states[0].get("owner") in (None, key[0]):
+                errors.append(f"{key}: WAITLISTED without another seat owner")
+        else:
+            errors.append(f"{key}: invalid response status")
+
+        if cmd == "RESERVE_MULTI":
+            expected = set(numbers) if status == "SUCCESS" else set()
+            if {change["seat"] for change in changes} != expected:
                 errors.append(f"{key}: partial multi reservation")
-            numbers = request["seats"]
-            valid = (2 <= len(numbers) <= 4 and all(type(n) is int and 1 <= n <= 100 for n in numbers)
-                     and len(set(numbers)) == len(numbers))
-            if valid and locks.get(key) != sorted(numbers):
+            if locks.get(key) != expected_seats:
                 errors.append(f"{key}: missing lock order")
     result = verify_final(server_snapshot, reports, cid_count, request_count,
                           response_counts, notification_counts)

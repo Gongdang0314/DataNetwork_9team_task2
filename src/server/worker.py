@@ -46,11 +46,16 @@ class WorkerPool:
 
     def handle(self, wid, cid, request):
         rid, cmd, numbers = request["rid"], request["cmd"], request["seats"]
-        self.logger.log(cmd, "INFO", phase="processing", worker=wid, cid=cid, rid=rid, seats=numbers)
-        valid = (isinstance(numbers, list) and
-                 all(integer(n, 1, NUM_SEATS) for n in numbers) and
+        integer_seats = isinstance(numbers, list) and all(integer(n) for n in numbers)
+        valid = (integer_seats and
+                 all(1 <= n <= NUM_SEATS for n in numbers) and
                  len(numbers) == len(set(numbers)) and
                  (2 <= len(numbers) <= 4 if cmd == "RESERVE_MULTI" else len(numbers) == 1))
+        # Untrusted values can contain infinities or deeply nested containers that
+        # cannot be written as log JSON. Keep flat integer inputs (even out of
+        # range) for diagnosis; represent invalid types as null and reply FAIL.
+        self.logger.log(cmd, "INFO", phase="processing", worker=wid, cid=cid, rid=rid,
+                        seats=numbers if integer_seats else None)
         if not valid:
             self.respond(cid, rid, cmd, "FAIL", [], "invalid seats")
             return

@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from src.common.logger import EventLogger
 from src.common.protocol import Decoder, encode_msg
@@ -60,10 +61,15 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual((cid, request["rid"]), (1, 1))
         self.queue.task_done()
 
-    def test_deep_json_unregistered_peer_does_not_kill_listener(self):
+    def test_json_recursion_error_unregistered_peer_does_not_kill_listener(self):
         bad = self.connect()
-        bad.sendall(b'{"type":"HELLO","nested":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}\n')
-        reply = json.loads(bad.makefile("rb").readline())
+        frame = encode_msg(dict(type="HELLO", cid=1, protocol=2, requests=2, nested=[]))
+        # JSON parser recursion limits differ between Python versions. Inject the
+        # parser exception while exercising the real decoder/listener/socket path.
+        with patch("src.common.protocol.json.loads", side_effect=RecursionError("test nesting")):
+            bad.sendall(frame)
+            raw_reply = bad.makefile("rb").readline()
+        reply = json.loads(raw_reply)
         self.assertEqual(reply["type"], "ERROR")
         self.assertIn("nesting", reply["reason"])
         self.assertEqual(bad.recv(1), b"")
@@ -72,11 +78,16 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue(self.listener.thread.is_alive())
         self.assertFalse(self.run.failed.is_set())
 
-    def test_deep_json_registered_peer_fails_run_without_killing_listener(self):
+    def test_json_recursion_error_registered_peer_fails_run_without_killing_listener(self):
         bad = self.connect()
         self.hello(bad)
-        bad.sendall(b'{"type":"REQUEST","nested":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}\n')
-        self.assertEqual(json.loads(bad.makefile("rb").readline())["type"], "ERROR")
+        frame = encode_msg(dict(type="REQUEST", rid=1, cmd="RESERVE", seats=[1], nested=[]))
+        with patch("src.common.protocol.json.loads", side_effect=RecursionError("test nesting")):
+            bad.sendall(frame)
+            raw_reply = bad.makefile("rb").readline()
+        reply = json.loads(raw_reply)
+        self.assertEqual(reply["type"], "ERROR")
+        self.assertIn("nesting", reply["reason"])
         self.assertTrue(self.run.failed.wait(2))
         self.assertTrue(self.listener.thread.is_alive())
         self.assertEqual(self.queue.qsize(), 0)

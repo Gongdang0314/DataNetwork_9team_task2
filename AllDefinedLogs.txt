@@ -19,6 +19,8 @@ CONNECT
 RESERVE / RESERVE_MULTI / CANCEL
 - CLIENT INFO phase=sent: type=REQUEST, rid, cmd, seats. 요청 전송 직전 기록.
 - SERVER INFO phase=processing: worker, cid, rid, seats. Worker 처리 시작.
+  잘못된 타입의 seats는 안전한 JSON 로깅을 위해 null로 표시하고 RESP FAIL로 처리한다.
+  정수 목록은 범위/개수/중복 오류가 있어도 입력값을 로그에 보존한다.
 - SERVER SUCCESS phase=transition: seat, version, before, after, cid, rid,
   assigned, released. 좌석 소유권 변경의 독립 검증 근거.
   handoff면 wait_ticket, wait_cid, wait_rid 추가.

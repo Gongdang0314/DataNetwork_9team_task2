@@ -246,11 +246,21 @@ Lock 경합: Worker의 좌석 try-acquire 실패 횟수.
 서버는 METRICS, Client는 TERMINATE에 최종 수치를 기록한다.
 
 11. 수정본 실측 결과표
-[정식 원격 실행 후 verification.json 및 로그에서 작성할 것]
-서버: Throughput __ req/s / Queue 최대 __건 / 이중예약 __건 / Deadlock __건
-Waitlist 평균 __초 / Lock 경합 __건 / 최종 정합성 PASS 또는 FAIL
-Client 30개 합계: 요청 150000 / SUCCESS __ / FAIL __ / WAITLISTED __
-NOTIFY 수신 __ / 미해결 __ / 평균 응답시간 __ms
+테스트 날짜: 2026-10-07 KST
+원격 호스트: AWS EC2 eu-north-1, Ubuntu, Python 3.14.4
+로컬 호스트: Windows 11, Python 3.14.6
+run_id: 1c2730b8-6008-43dd-92d0-3ba802a0399d
+로그 폴더: runs/final-01
+서버 실행: python3 -m src.server.main --host 0.0.0.0 --port 9000 --num-clients 30 --requests 5000 --log-dir runs/final-01 --quiet
+클라이언트 실행: python -m src.client.launcher --server-ip <EC2 IP> --server-port 9000 --num-clients 30 --requests 5000 --log-dir runs/final-01 --quiet
+
+서버: Throughput 48.76 req/s / Queue 최대 4건 / 이중예약 0건 / Deadlock 0건
+Waitlist 평균 31.828초 / Lock 경합 0건 / 최종 정합성 PASS
+Client 30개 합계: 요청 150000 / SUCCESS 60382 / FAIL 70681 / WAITLISTED 18937
+NOTIFY 수신 18683 / 미해결 254 / 평균 응답시간 291.58ms
+배정 40551 / 해제 40523 / 최종 점유 28석
+소요 시간: 3076초 (약 51분)
+검증: --submission PASS, 오류 0건, ACK 30/30, 전 스레드 join 완료
 로컬 개발/스트레스 실측은 별도 TEST_RESULTS.txt에 기록한다. 원격 실측으로 대체하지 않는다.
 
 12. 제출 체크리스트

@@ -1,0 +1,75 @@
+HW2 프로토콜 v2 로그 명세
+
+공통 형식:
+[HH:MM:SS.mmm] NODE | EVENT | STATUS | JSON payload
+NODE: SERVER / CLIENT1..CLIENT30
+시각: 실제 wall-clock, KST(+09:00). 성능 시간 차이는 노드 내 perf_counter 사용.
+STATUS: INFO(정보), SUCCESS(성공), FAIL(실패), WARN(대기/거부된 미등록 접속).
+wire 응답의 WAITLISTED는 JSON status 필드에 저장하며 로그 STATUS는 WARN이다.
+모든 요청/응답/통지는 파일에 기록한다. --quiet는 파일을 생략하지 않는다.
+객체 키 순서는 의미가 없다. 숫자는 실측값이며 원격 예시 숫자를 상수로 넣지 않는다.
+
+INIT
+- SERVER SUCCESS: run_id, protocol, host, port, clients, requests, workers, threads,
+  timezone, os, python, queue. 실행 설정 및 환경.
+- CLIENT SUCCESS: run_id, protocol, requests, interval_min/max, seed, timezone.
+CONNECT
+- SERVER SUCCESS: cid, run_id. 유효한 HELLO 등록.
+- CLIENT SUCCESS: server_ip, server_port.
+RESERVE / RESERVE_MULTI / CANCEL
+- CLIENT INFO phase=sent: type=REQUEST, rid, cmd, seats. 요청 전송 직전 기록.
+- SERVER INFO phase=processing: worker, cid, rid, seats. Worker 처리 시작.
+- SERVER SUCCESS phase=transition: seat, version, before, after, cid, rid,
+  assigned, released. 좌석 소유권 변경의 독립 검증 근거.
+  handoff면 wait_ticket, wait_cid, wait_rid 추가.
+- SERVER SUCCESS/FAIL 또는 WAITLISTED 응답:
+  phase=response, cid, type=RESP, rid, cmd, status, states, reason.
+  주의: 코드에서 WAITLISTED 응답의 로그 STATUS는 WARN으로 기록한다.
+- CLIENT SUCCESS/FAIL phase=response: 원본 응답 내용 + response_ms.
+  WAITLISTED 첫 응답은 WAITLIST 이벤트 WARN으로 기록.
+LOCK
+- SERVER SUCCESS: cid, rid, worker, order, contention.
+  유효한 RESERVE_MULTI의 실제 획득 오름차순, 해당 요청의 try-acquire 실패 수.
+  입력 사전 검사 실패는 Lock을 잡지 않아 LOCK 이벤트가 없다.
+WAITLIST
+- SERVER SUCCESS: cid, rid, seat, ticket, registered, position.
+  FIFO 등록 정보. registered는 서버 내 perf_counter 시각.
+- CLIENT WARN: phase=response, 원본 WAITLISTED 응답 + response_ms.
+NOTIFY
+- SERVER SUCCESS: cid, rid, state, ticket, waited. 전송 완료 및 최초 등록 이후 초.
+- CLIENT SUCCESS: type=NOTIFY, rid, state. 실제 수신한 통지.
+  state는 {seat, version, owner}. 오래된 version은 보유 상태에 재반영하지 않는다.
+POOL
+- SERVER INFO: queue, max_queue, unfinished, processed, seats.
+  seats에 모든 1..100번의 seat/owner/waiting을 포함. 5초마다 기록.
+REPORT
+- CLIENT INFO: run_id, sent, responded, results, notify, waitlisted,
+  response_ms_total, avg_response_ms, final_held, hot_selections, seat_selections,
+  interval_min/max. FINISH 후 서버로 전달한 최종 대조 자료.
+DOUBLE_BOOKING_CHECK
+- SERVER SUCCESS: run_id, status=PASS, errors, assigned, released, reserved_now,
+  double_bookings, pending_waitlist, results, avg_response_ms, final_owners.
+  상태 불변조건/수지/클라이언트 보유 검증 성공. 실패는 ERROR/TERMINATE FAIL에 남긴다.
+METRICS
+- SERVER SUCCESS: run_id, responses, throughput, elapsed_seconds,
+  waitlist_mean_seconds, notified, contention, deadlocks, error, max_queue,
+  avg_response_ms.
+DISCONNECT
+- SERVER INFO: 정상 ACK 후 접속 종료 cid.
+- SERVER FAIL: ACK 이전 등록 클라이언트 단절 cid. 실행을 실패 처리.
+ERROR
+- SERVER WARN: 잘못된 미등록 연결 거부 cid=null, error. Listener는 계속 동작.
+- SERVER FAIL: 등록 연결/스레드/검증/타임아웃 오류 error (필요시 cid/worker).
+TERMINATE
+- SERVER INFO phase=final_state: run_id, seats. 모든 좌석의 owner/version,
+  assigned/released/double_bookings, 미해결 waitlist의 cid/rid/ticket.
+- CLIENT SUCCESS: run_id, bye_received=true 및 최종 summary.
+  서버 BYE를 실제 받은 뒤 기록하고 ACK를 전송한다.
+- CLIENT FAIL: run_id, bye_received=false, errors 및 시도된 요청의 현재 summary.
+  실패 실행의 sent는 전송 준비된 요청 수이며 전달 성공을 보증하지 않는다.
+- SERVER SUCCESS/FAIL phase=closed: run_id, all_threads_joined,
+  acknowledged, error. 정상 종료는 모든 클라이언트 ACK와 모든 스레드 join을 요구한다.
+
+로그의 per-seat version/FIFO ticket과 req ID가 동시성 검증의 기준이다.
+임계구역 밖에서 파일 I/O를 하므로 서로 다른 Worker의 로그 줄 순서가
+좌석 상태 변경 순서와 항상 같지는 않다. src.verify가 이 번호로 재생한다.

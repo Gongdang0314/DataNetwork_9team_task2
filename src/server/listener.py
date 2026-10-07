@@ -1,167 +1,211 @@
-"""
-Listener Thread — single thread watching all client sockets via selectors.
-Accepts connections, parses messages, enqueues to Request Queue.
-"""
-
+"""Single selectors listener, with per-connection send locks and bounded writes."""
 import select
 import selectors
 import socket
 import threading
-from queue import Queue
+import time
+from dataclasses import dataclass, field
+from src.common.protocol import (COMMANDS, Decoder, PROTOCOL_VERSION, RECV_BUF,
+                                 encode_msg, integer)
 
-from src.common.protocol import (
-    RECV_BUF, ENCODING, MSG_DELIM,
-    MSG_HELLO, MSG_RESERVE, MSG_RESERVE_MULTI, MSG_CANCEL,
-    encode_msg,
-)
-from src.common.logger import log_event
+
+@dataclass
+class Connection:
+    sock: socket.socket
+    accepted: float = field(default_factory=time.monotonic)
+    decoder: Decoder = field(default_factory=Decoder)
+    send_lock: threading.Lock = field(default_factory=threading.Lock)
+    cid: int | None = None
+    seen: set = field(default_factory=set)
+    closed: bool = False
+    finish_sent: bool = False
+    bye_sent: bool = False
 
 
 class Listener:
-    def __init__(self, host: str, port: int, request_queue: Queue,
-                 num_clients: int, log_file, stats):
-        self.host = host
-        self.port = port
-        self.request_queue = request_queue
-        self.num_clients = num_clients
-        self.log_file = log_file
-        self.stats = stats
-
-        self.sel = selectors.DefaultSelector()
-        self.server_sock: socket.socket | None = None
-        self.client_sockets: dict[int, socket.socket] = {}   # client_id -> socket
-        self.socket_to_cid: dict[socket.socket, int] = {}    # socket -> client_id
-        self.socket_locks: dict[int, threading.Lock] = {}     # client_id -> send lock
-        self.buffers: dict[socket.socket, str] = {}           # socket -> recv buffer
-        self.connected = 0
-        self.running = True
-        self.thread: threading.Thread | None = None
-        self.all_connected = threading.Event()
+    def __init__(self, host, port, request_queue, logger, run, send_timeout=10):
+        self.host, self.port, self.queue = host, port, request_queue
+        self.logger, self.run, self.send_timeout = logger, run, send_timeout
+        self.selector = selectors.DefaultSelector()
+        self.registry_lock = threading.Lock()
+        self.connections = {}
+        self.clients = {}
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._loop, name="Listener", daemon=True)
+        self.server_sock = None
 
     def start(self):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind((self.host, self.port))
-        self.server_sock.listen(self.num_clients + 5)
+        self.server_sock.listen(self.run.clients + 5)
         self.server_sock.setblocking(False)
-        self.sel.register(self.server_sock, selectors.EVENT_READ, data=None)
-
-        self.thread = threading.Thread(target=self._loop, daemon=True, name="Listener")
+        self.port = self.server_sock.getsockname()[1]
+        self.selector.register(self.server_sock, selectors.EVENT_READ, None)
         self.thread.start()
 
     def stop(self):
-        self.running = False
+        self.stopping.set()
 
-    def join(self):
-        if self.thread:
-            self.thread.join(timeout=5)
+    def join(self, timeout=None):
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
 
-    def send_to(self, client_id: int, msg: str):
-        """Thread-safe send to a specific client (non-blocking safe)."""
-        sock = self.client_sockets.get(client_id)
-        if sock is None:
-            return
-        lock = self.socket_locks.get(client_id)
-        data = encode_msg(msg)
+    def send_to(self, cid, message):
+        with self.registry_lock:
+            connection = self.clients.get(cid)
+        if connection is None:
+            return False
+        if message["type"] in {"FINISH", "BYE"}:
+            with self.registry_lock:
+                if message["type"] == "FINISH":
+                    connection.finish_sent = True
+                else:
+                    connection.bye_sent = True
+        return self._send(connection, message)
+
+    def _send(self, connection, message):
+        data = encode_msg(message)
         try:
-            with lock:
-                total_sent = 0
-                while total_sent < len(data):
-                    _, writable, _ = select.select([], [sock], [], 5.0)
+            # Include lock contention in the deadline, so failure cleanup is bounded.
+            deadline = time.perf_counter() + self.send_timeout
+            if not connection.send_lock.acquire(timeout=self.send_timeout):
+                return False
+            try:
+                if connection.closed:
+                    return False
+                while data:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        return False
+                    _, writable, _ = select.select([], [connection.sock], [], remaining)
                     if not writable:
-                        break
-                    n = sock.send(data[total_sent:])
-                    total_sent += n
-        except OSError:
+                        return False
+                    try:
+                        sent = connection.sock.send(data)
+                    except BlockingIOError:
+                        continue
+                    if sent == 0:
+                        return False
+                    data = data[sent:]
+                return True
+            finally:
+                connection.send_lock.release()
+        except (OSError, ValueError):
+            return False
+
+    def broadcast(self, message):
+        with self.registry_lock:
+            ids = list(self.clients)
+        ok = True
+        for cid in ids:
+            if not self.send_to(cid, message):
+                self.run.fail(f"{message['type']} delivery failed: Client{cid}")
+                ok = False
+        return ok
+
+    def _drop(self, connection):
+        try:
+            self.selector.unregister(connection.sock)
+        except (KeyError, ValueError):
             pass
-
-    def send_all(self, msg: str):
-        for cid in list(self.client_sockets):
-            self.send_to(cid, msg)
-
-    # ------------------------------------------------------------------ #
+        with self.registry_lock:
+            self.connections.pop(connection.sock, None)
+            if connection.cid is not None:
+                self.clients.pop(connection.cid, None)
+        with connection.send_lock:
+            connection.closed = True
+            connection.sock.close()
+        if connection.cid is not None:
+            with self.run.cv:
+                acknowledged = connection.cid in self.run.acks
+            if not acknowledged and not self.stopping.is_set():
+                self.run.fail(f"Client{connection.cid} disconnected before final acknowledgement")
+            self.logger.log("DISCONNECT", "INFO" if acknowledged else "FAIL", cid=connection.cid)
 
     def _loop(self):
-        while self.running:
-            try:
-                events = self.sel.select(timeout=1.0)
-            except (OSError, ValueError):
-                break
-            for key, mask in events:
-                if key.data is None:
-                    self._accept(key.fileobj)
-                else:
-                    self._read(key)
-
-    def _accept(self, server_sock):
-        conn, addr = server_sock.accept()
-        conn.setblocking(False)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.buffers[conn] = ""
-        self.sel.register(conn, selectors.EVENT_READ, data=conn)
-
-    def _read(self, key):
-        conn: socket.socket = key.data
         try:
-            raw = conn.recv(RECV_BUF)
+            while not self.stopping.is_set():
+                for key, _ in self.selector.select(timeout=0.2):
+                    if key.data is None:
+                        try:
+                            sock, _ = self.server_sock.accept()
+                        except BlockingIOError:
+                            continue
+                        sock.setblocking(False)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        connection = Connection(sock)
+                        with self.registry_lock:
+                            self.connections[sock] = connection
+                        self.selector.register(sock, selectors.EVENT_READ, connection)
+                    else:
+                        self._read(key.data)
+        except Exception as exc:
+            self.run.fail(f"Listener: {exc}")
+            self.logger.log("ERROR", "FAIL", error=str(exc))
+        finally:
+            for connection in list(self.connections.values()):
+                self._drop(connection)
+            if self.server_sock:
+                self.server_sock.close()
+            self.selector.close()
+
+    def _read(self, connection):
+        try:
+            data = connection.sock.recv(RECV_BUF)
+            if not data:
+                self._drop(connection)
+                return
+            for message in connection.decoder.feed(data):
+                self._parse(connection, message)
         except BlockingIOError:
-            return  # No data available yet, retry later
-        except (ConnectionResetError, OSError):
-            raw = b""
-        if not raw:
-            self.sel.unregister(conn)
-            conn.close()
+            return
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.logger.log("ERROR", "WARN" if connection.cid is None else "FAIL",
+                            cid=connection.cid, error=str(exc))
+            self._send(connection, dict(type="ERROR", reason=str(exc)))
+            # A bad unauthenticated connection cannot kill the listener. An admitted
+            # client's protocol/transport failure invalidates this measured run.
+            self._drop(connection)
+
+    def _parse(self, connection, message):
+        kind = message["type"]
+        if connection.cid is None:
+            cid = message.get("cid")
+            if (kind != "HELLO" or not integer(cid, 1, self.run.clients)
+                    or message.get("protocol") != PROTOCOL_VERSION
+                    or message.get("requests") != self.run.requests):
+                raise ValueError("HELLO must match protocol, client ID range and request count")
+            with self.registry_lock:
+                if cid in self.run.connected:
+                    raise ValueError("duplicate client ID; reconnect is not supported")
+                connection.cid = cid
+                self.clients[cid] = connection
+            self.run.connect(cid, connection.accepted)
+            self.logger.log("CONNECT", "SUCCESS", cid=cid, run_id=self.run.run_id)
+            if not self._send(connection, dict(type="WELCOME", protocol=PROTOCOL_VERSION,
+                                               run_id=self.run.run_id, requests=self.run.requests)):
+                raise ValueError("WELCOME delivery failed")
             return
 
-        self.buffers[conn] += raw.decode(ENCODING, errors="replace")
-        buf = self.buffers[conn]
-        while MSG_DELIM in buf:
-            line, buf = buf.split(MSG_DELIM, 1)
-            line = line.strip()
-            if line:
-                self._parse(conn, line)
-        self.buffers[conn] = buf
-
-    def _parse(self, conn: socket.socket, line: str):
-        parts = line.split()
-        if not parts:
-            return
-        cmd = parts[0].upper()
-
-        if cmd == MSG_HELLO and len(parts) >= 2:
-            cid = int(parts[1])
-            self.client_sockets[cid] = conn
-            self.socket_to_cid[conn] = cid
-            self.socket_locks[cid] = threading.Lock()
-            self.connected += 1
-            log_event(self.log_file, "SERVER", "CONNECT", "SUCCESS",
-                      f"Client{cid} connected ({self.connected}/{self.num_clients}).")
-            if self.connected >= self.num_clients:
-                self.all_connected.set()
-
-        elif cmd == MSG_RESERVE and len(parts) >= 3:
-            cid = self._find_client(conn)
-            if cid is None:
-                return
-            rid = int(parts[1])
-            seat = int(parts[2])
-            self.request_queue.put((cid, rid, "RESERVE", [seat]))
-
-        elif cmd == MSG_RESERVE_MULTI and len(parts) >= 3:
-            cid = self._find_client(conn)
-            if cid is None:
-                return
-            rid = int(parts[1])
-            seats = [int(s) for s in parts[2].split(",")]
-            self.request_queue.put((cid, rid, "RESERVE_MULTI", seats))
-
-        elif cmd == MSG_CANCEL and len(parts) >= 3:
-            cid = self._find_client(conn)
-            if cid is None:
-                return
-            rid = int(parts[1])
-            seat = int(parts[2])
-            self.request_queue.put((cid, rid, "CANCEL", [seat]))
-
-    def _find_client(self, conn: socket.socket) -> int | None:
-        return self.socket_to_cid.get(conn)
+        cid = connection.cid
+        if kind == "REQUEST":
+            rid, cmd = message.get("rid"), message.get("cmd")
+            if connection.finish_sent or self.run.failed.is_set():
+                raise ValueError("requests are closed")
+            if (not integer(rid, 1, self.run.requests) or rid in connection.seen
+                    or cmd not in COMMANDS):
+                raise ValueError("invalid/duplicate request ID or unknown command")
+            # Invalid seat count/type/range is an ordinary FAIL, decided by a worker.
+            connection.seen.add(rid)
+            self.queue.put((cid, dict(rid=rid, cmd=cmd, seats=message.get("seats"))))
+        elif kind == "REPORT" and connection.finish_sent and not connection.bye_sent:
+            if message.get("run_id") != self.run.run_id or not isinstance(message.get("summary"), dict):
+                raise ValueError("invalid final report")
+            self.run.report(cid, message["summary"])
+        elif kind == "ACK" and connection.bye_sent:
+            if message.get("run_id") != self.run.run_id:
+                raise ValueError("wrong run acknowledgement")
+            self.run.ack(cid)
+        else:
+            raise ValueError("unexpected message type/phase")

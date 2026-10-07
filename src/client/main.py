@@ -1,247 +1,143 @@
-"""
-Client entry point.
-Usage: python -m client.main --server-ip 127.0.0.1 --server-port 9000 --id 1 [--requests 5000] [--log-dir ../logs]
-"""
-
+"""Independent sender/receiver: never wait for a seat or response before sending."""
 import argparse
-import os
-import random
 import socket
 import threading
-import time
-
-from src.common.protocol import (
-    NUM_SEATS, REQUESTS_PER_CLIENT,
-    CLIENT_INTERVAL_MIN, CLIENT_INTERVAL_MAX,
-    HOT_SEAT_MIN, HOT_SEAT_MAX, HOT_SEAT_RATIO,
-    ENCODING, MSG_DELIM, RECV_BUF, encode_msg,
-)
-from src.common.logger import log_event
+from pathlib import Path
+from src.common.logger import EventLogger
+from src.common.protocol import (CLIENT_INTERVAL_MIN, CLIENT_INTERVAL_MAX, REQUESTS_PER_CLIENT,
+                                 PROTOCOL_VERSION, Decoder, RECV_BUF, encode_msg)
+from src.client.state import ClientState, RequestGenerator
 
 
-def main():
-    parser = argparse.ArgumentParser(description="HW2 Seat Reservation Client")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="HW2 seat client (Python 3.10+)")
     parser.add_argument("--server-ip", required=True)
     parser.add_argument("--server-port", type=int, required=True)
     parser.add_argument("--id", type=int, required=True)
     parser.add_argument("--requests", type=int, default=REQUESTS_PER_CLIENT)
-    parser.add_argument("--log-dir", default="../logs")
-    args = parser.parse_args()
-
-    cid = args.id
-    node = f"CLIENT{cid}"
-    os.makedirs(args.log_dir, exist_ok=True)
-    log_path = os.path.join(args.log_dir, f"Client{cid}.txt")
-    log_file = open(log_path, "w", encoding="utf-8")
-
-    # State
-    owned_seats: set[int] = set()       # seats I currently own
-    pending_requests: dict[int, tuple[float, str]] = {}  # req_id -> (send_time, cmd)
-    waitlisted_reqs: set[int] = set()
-    response_count = 0
-    resp_times: list[float] = []
-    result_counts = {"SUCCESS": 0, "FAIL": 0, "WAITLISTED": 0}
-    notify_count = 0
-    lock = threading.Lock()
-    done_sending = threading.Event()
-    done_receiving = threading.Event()
-    bye_received = threading.Event()
-
-    # Connect
+    parser.add_argument("--log-dir", default="runs/current")
+    parser.add_argument("--interval-min", type=float, default=CLIENT_INTERVAL_MIN)
+    parser.add_argument("--interval-max", type=float, default=CLIENT_INTERVAL_MAX)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+    if args.id < 1 or args.requests < 1 or not 0 <= args.interval_min <= args.interval_max:
+        parser.error("positive id/requests and 0 <= interval-min <= interval-max required")
+    logger = EventLogger(Path(args.log_dir) / f"Client{args.id}.txt", f"CLIENT{args.id}", args.quiet)
+    state, generator = ClientState(args.id, args.requests), RequestGenerator(args.seed)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((args.server_ip, args.server_port))
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.sendall(encode_msg(f"HELLO {cid}"))
-    log_event(log_file, node, "CONNECT", "SUCCESS",
-              f"Connected to {args.server_ip}:{args.server_port}.")
+    decoder = Decoder()
+    send_lock = threading.Lock()
+    terminal, aborted = threading.Event(), threading.Event()
+    errors, receiver_thread, run_id = [], None, None
+    received_bye = False
 
-    # --- Receiver thread --- #
+    def send(message):
+        with send_lock:
+            sock.sendall(encode_msg(message))
+
     def receiver():
-        nonlocal response_count, notify_count
-        buf = ""
-        while not bye_received.is_set():
-            try:
-                raw = sock.recv(RECV_BUF)
-            except OSError:
-                break
-            if not raw:
-                break
-            buf += raw.decode(ENCODING, errors="replace")
-            while MSG_DELIM in buf:
-                line, buf = buf.split(MSG_DELIM, 1)
-                line = line.strip()
-                if not line:
-                    continue
-                _handle_response(line)
-
-    def _handle_response(line: str):
-        nonlocal response_count, notify_count
-        parts = line.split()
-        if not parts:
-            return
-
-        if parts[0] == "RESP" and len(parts) >= 3:
-            rid = int(parts[1])
-            status = parts[2]
-            recv_time = time.monotonic()
-            with lock:
-                req_info = pending_requests.pop(rid, None)
-                if req_info is not None:
-                    send_time, req_cmd = req_info
-                    resp_times.append((recv_time - send_time) * 1000)
-                else:
-                    req_cmd = None
-                result_counts[status] = result_counts.get(status, 0) + 1
-                response_count += 1
-
-                if status == "SUCCESS":
-                    detail = " ".join(parts[3:]) if len(parts) > 3 else ""
-                    if req_cmd == "CANCEL":
-                        _update_owned_on_cancel(detail)
-                    else:
-                        _update_owned_on_success(detail)
-                elif status == "WAITLISTED":
-                    waitlisted_reqs.add(rid)
-                elif status == "FAIL":
-                    pass
-
-            log_event(log_file, node, _event_for_status(status), status,
-                      f"req={rid} {status}. resp_time={resp_times[-1]:.0f}ms." if resp_times else f"req={rid} {status}.")
-
-            if response_count >= args.requests:
-                done_receiving.set()
-
-        elif parts[0] == "NOTIFY" and len(parts) >= 3:
-            rid = int(parts[1])
-            seat_num = int(parts[2])
-            with lock:
-                notify_count += 1
-                owned_seats.add(seat_num)
-                waitlisted_reqs.discard(rid)
-            log_event(log_file, node, "NOTIFY", "SUCCESS",
-                      f"req={rid} seat#{seat_num} assigned from waitlist.")
-
-        elif parts[0] == "BYE":
-            bye_received.set()
-
-    def _event_for_status(status):
-        if status == "WAITLISTED":
-            return "WAITLIST"
-        return "RESERVE"
-
-    def _update_owned_on_success(detail):
-        # Try to extract seat numbers from detail like "seat#5" or "seats[3,5]"
-        if "seats[" in detail:
-            inner = detail.split("[")[1].split("]")[0]
-            for s in inner.split(","):
-                owned_seats.add(int(s.strip()))
-        elif "seat#" in detail:
-            s = detail.split("seat#")[1].split()[0]
-            owned_seats.add(int(s))
-
-    def _update_owned_on_cancel(detail):
-        if "seat#" in detail:
-            s = detail.split("seat#")[1].split()[0]
-            owned_seats.discard(int(s))
-
-    recv_thread = threading.Thread(target=receiver, daemon=True, name=f"Client{cid}-recv")
-    recv_thread.start()
-
-    # --- Sender loop --- #
-    req_id = 0
-    for i in range(args.requests):
-        req_id += 1
-        cmd, msg = _make_request(cid, req_id, owned_seats, lock)
-
-        send_time = time.monotonic()
-        with lock:
-            pending_requests[req_id] = (send_time, cmd)
-
+        nonlocal received_bye
+        finishing = False
         try:
-            sock.sendall(encode_msg(msg))
+            while not terminal.is_set():
+                try:
+                    data = sock.recv(RECV_BUF)
+                except socket.timeout:
+                    continue
+                if not data:
+                    raise ConnectionError("server disconnected before BYE")
+                for message in decoder.feed(data):
+                    kind = message["type"]
+                    if kind == "RESP" and not finishing:
+                        elapsed = state.response(message)
+                        status = message["status"]
+                        logger.log("WAITLIST" if status == "WAITLISTED" else message["cmd"],
+                                   "WARN" if status == "WAITLISTED" else status,
+                                   phase="response", response_ms=elapsed, **message)
+                    elif kind == "NOTIFY" and not finishing:
+                        state.notify(message)
+                        logger.log("NOTIFY", "SUCCESS", **message)
+                    elif kind == "FINISH" and not finishing:
+                        if message["run_id"] != run_id:
+                            raise ValueError("wrong run ID")
+                        summary = state.summary()
+                        if summary["sent"] != args.requests or summary["responded"] != args.requests:
+                            raise ValueError("FINISH received before all requests completed")
+                        finishing = True
+                        summary.update(interval_min=args.interval_min, interval_max=args.interval_max)
+                        logger.log("REPORT", "INFO", run_id=run_id, **summary)
+                        send(dict(type="REPORT", run_id=run_id, summary=summary))
+                    elif kind == "BYE" and finishing:
+                        if message["run_id"] != run_id or message["status"] != "PASS":
+                            raise ValueError("server verification failed")
+                        logger.log("TERMINATE", "SUCCESS", run_id=run_id, bye_received=True, **state.summary())
+                        send(dict(type="ACK", run_id=run_id))
+                        received_bye = True
+                        terminal.set()
+                        return
+                    elif kind == "ERROR":
+                        raise RuntimeError(message.get("reason", "server error"))
+                    else:
+                        raise ValueError(f"unexpected server message: {kind}")
+        except Exception as exc:
+            errors.append(str(exc))
+            aborted.set()
+            terminal.set()
+
+    try:
+        sock.settimeout(10)
+        sock.connect((args.server_ip, args.server_port))
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        send(dict(type="HELLO", protocol=PROTOCOL_VERSION, cid=args.id, requests=args.requests))
+        welcome = []
+        while not welcome:
+            data = sock.recv(RECV_BUF)
+            if not data:
+                raise ConnectionError("server closed during handshake")
+            welcome = decoder.feed(data)
+        if len(welcome) != 1 or welcome[0].get("type") != "WELCOME":
+            raise ValueError(f"HELLO rejected: {welcome}")
+        run_id = welcome[0]["run_id"]
+        if welcome[0]["requests"] != args.requests or welcome[0]["protocol"] != PROTOCOL_VERSION:
+            raise ValueError("configuration mismatch")
+        sock.settimeout(1)
+        logger.log("INIT", "SUCCESS", run_id=run_id, protocol=PROTOCOL_VERSION,
+                   requests=args.requests, interval_min=args.interval_min,
+                   interval_max=args.interval_max, seed=args.seed, timezone="KST(+09:00)")
+        logger.log("CONNECT", "SUCCESS", server_ip=args.server_ip, server_port=args.server_port)
+        receiver_thread = threading.Thread(target=receiver, name=f"Client{args.id}-receiver")
+        receiver_thread.start()
+        for rid in range(1, args.requests + 1):
+            if terminal.is_set():
+                break
+            cmd, seats = generator.make(state)
+            state.prepare(rid, cmd, seats)
+            request = dict(type="REQUEST", rid=rid, cmd=cmd, seats=seats)
+            logger.log(cmd, "INFO", phase="sent", **request)
+            send(request)
+            if rid != args.requests:
+                terminal.wait(generator.rng.uniform(args.interval_min, args.interval_max))
+        # There is deliberately no 60-second exit: other clients may still run.
+        terminal.wait()
+    except (Exception, KeyboardInterrupt) as exc:
+        errors.append(str(exc) or "interrupted")
+        aborted.set()
+        terminal.set()
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
         except OSError:
-            break
-
-        event = cmd.split()[0] if cmd else "RESERVE"
-        log_event(log_file, node, event, "INFO", f"req={req_id} sent {msg}.")
-
-        interval = random.uniform(CLIENT_INTERVAL_MIN, CLIENT_INTERVAL_MAX)
-        time.sleep(interval)
-
-    done_sending.set()
-    log_event(log_file, node, "RESERVE", "INFO",
-              f"All {args.requests} requests sent. Waiting for responses...")
-
-    # Wait for all responses, then wait for BYE
-    done_receiving.wait(timeout=300)
-    bye_received.wait(timeout=60)
-
-    # Final summary
-    with lock:
-        avg_resp = sum(resp_times) / len(resp_times) if resp_times else 0
-        final_held = sorted(owned_seats)
-
-    log_event(log_file, node, "TERMINATE", "SUCCESS",
-              f"Termination signal received. sent={args.requests} responded={response_count} "
-              f"SUCCESS={result_counts.get('SUCCESS', 0)} FAIL={result_counts.get('FAIL', 0)} "
-              f"WAITLISTED={result_counts.get('WAITLISTED', 0)} "
-              f"notify={notify_count} avg_resp={avg_resp:.0f}ms "
-              f"final_held={final_held}.")
-
-    sock.close()
-    log_file.close()
-
-
-def _make_request(cid: int, req_id: int, owned_seats: set, lock: threading.Lock) -> tuple[str, str]:
-    """Generate a random request based on current state."""
-    with lock:
-        has_seats = len(owned_seats) > 0
-        owned_copy = list(owned_seats)
-
-    if has_seats:
-        r = random.random()
-        if r < 0.30:
-            cmd = "RESERVE"
-        elif r < 0.50:
-            cmd = "RESERVE_MULTI"
-        else:
-            cmd = "CANCEL"
-    else:
-        r = random.random()
-        if r < 0.60:
-            cmd = "RESERVE"
-        else:
-            cmd = "RESERVE_MULTI"
-
-    if cmd == "RESERVE":
-        seat = _pick_seat()
-        return cmd, f"RESERVE {req_id} {seat}"
-
-    elif cmd == "RESERVE_MULTI":
-        n = random.randint(2, 4)
-        seats = set()
-        while len(seats) < n:
-            seats.add(_pick_seat())
-        seats_str = ",".join(str(s) for s in sorted(seats))
-        return cmd, f"RESERVE_MULTI {req_id} {seats_str}"
-
-    else:  # CANCEL
-        if owned_copy:
-            seat = random.choice(owned_copy)
-            with lock:
-                owned_seats.discard(seat)
-            return cmd, f"CANCEL {req_id} {seat}"
-        else:
-            seat = _pick_seat()
-            return "RESERVE", f"RESERVE {req_id} {seat}"
-
-
-def _pick_seat() -> int:
-    if random.random() < HOT_SEAT_RATIO:
-        return random.randint(HOT_SEAT_MIN, HOT_SEAT_MAX)
-    else:
-        return random.randint(1, NUM_SEATS)
+            pass
+        if receiver_thread:
+            receiver_thread.join()
+        sock.close()
+        if not received_bye or aborted.is_set():
+            logger.log("TERMINATE", "FAIL", run_id=run_id, bye_received=False,
+                       errors=errors, **state.summary())
+        logger.close()
+    return 0 if received_bye and not aborted.is_set() else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

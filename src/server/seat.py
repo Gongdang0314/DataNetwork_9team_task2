@@ -1,38 +1,66 @@
-"""
-Seat map with per-seat Mutex and Waitlist (FIFO).
-"""
-
+"""All mutable seat fields are accessed while holding that seat's mutex."""
 import threading
 from collections import deque
-
+from dataclasses import dataclass
 from src.common.protocol import NUM_SEATS
 
 
-class Seat:
-    __slots__ = ("number", "lock", "owner", "waitlist")
+@dataclass(frozen=True)
+class Waiter:
+    cid: int
+    rid: int
+    registered: float
+    ticket: int
 
-    def __init__(self, number: int):
+
+class Seat:
+    def __init__(self, number):
         self.number = number
         self.lock = threading.Lock()
-        self.owner: int | None = None          # client_id or None
-        self.waitlist: deque[tuple[int, int]] = deque()  # (client_id, req_id)
+        self.owner = None
+        self.version = 0
+        self.waitlist = deque()
+        self.next_ticket = 0
+        self.last_handoff_ticket = 0
+        self.assigned = self.released = self.double_bookings = 0
 
+    def state_locked(self):
+        return dict(seat=self.number, version=self.version, owner=self.owner)
+
+    def change_locked(self, expected, owner, *, cid, rid, waiter=None):
+        """Check the precondition at the mutation, not just the final map."""
+        if self.owner != expected or self.owner == owner:
+            self.double_bookings += 1
+            raise RuntimeError(f"invalid ownership transition for seat {self.number}")
+        before = self.owner
+        if before is not None:
+            self.released += 1
+        if owner is not None:
+            self.assigned += 1
+        self.owner = owner
+        self.version += 1
+        event = dict(seat=self.number, version=self.version, before=before, after=owner,
+                     cid=cid, rid=rid, assigned=self.assigned, released=self.released)
+        if waiter:
+            if waiter.ticket <= self.last_handoff_ticket:
+                raise RuntimeError("waitlist FIFO violation")
+            self.last_handoff_ticket = waiter.ticket
+            event.update(wait_ticket=waiter.ticket, wait_cid=waiter.cid, wait_rid=waiter.rid)
+        return event
 
 class SeatMap:
     def __init__(self):
-        self.seats: list[Seat] = [Seat(i) for i in range(NUM_SEATS + 1)]  # 1-indexed (index 0 unused)
+        self.seats = {i: Seat(i) for i in range(1, NUM_SEATS + 1)}
 
-    def get(self, seat_num: int) -> Seat:
-        return self.seats[seat_num]
+    def get(self, number):
+        return self.seats[number]
 
-    def is_valid(self, seat_num: int) -> bool:
-        return 1 <= seat_num <= NUM_SEATS
-
-    def snapshot(self) -> dict[int, int | None]:
-        """Return {seat_num: owner} for all seats (for POOL log / final check)."""
+    def snapshot(self):
         result = {}
-        for i in range(1, NUM_SEATS + 1):
-            s = self.seats[i]
-            with s.lock:
-                result[i] = s.owner
+        for number, seat in self.seats.items():
+            with seat.lock:
+                result[number] = dict(**seat.state_locked(), assigned=seat.assigned,
+                                      released=seat.released, double_bookings=seat.double_bookings,
+                                      waitlist=[dict(cid=w.cid, rid=w.rid, ticket=w.ticket)
+                                                for w in seat.waitlist])
         return result

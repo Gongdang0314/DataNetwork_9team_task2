@@ -27,6 +27,19 @@ def encode_msg(message):
                        allow_nan=False) + "\n").encode("utf-8")
 
 
+def _check_depth(obj, limit=200):
+    """Iterative depth check; works even when json.loads handles deep nesting natively."""
+    stack = [(obj, 1)]
+    while stack:
+        current, d = stack.pop()
+        if d > limit:
+            raise ValueError("JSON nesting too deep")
+        if isinstance(current, dict):
+            stack.extend((v, d + 1) for v in current.values())
+        elif isinstance(current, list):
+            stack.extend((v, d + 1) for v in current)
+
+
 class Decoder:
     """Decode only complete byte frames, including split UTF-8 sequences."""
     def __init__(self):
@@ -43,9 +56,8 @@ class Decoder:
             try:
                 obj = json.loads(line.decode("utf-8"))
             except RecursionError as exc:
-                # Treat excessive nesting like other malformed frames so the
-                # listener can reject this peer without stopping every client.
                 raise ValueError("JSON nesting too deep") from exc
+            _check_depth(obj)
             if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
                 raise ValueError("message must be an object with a type")
             messages.append(obj)

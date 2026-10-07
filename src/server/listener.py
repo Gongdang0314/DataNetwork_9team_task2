@@ -54,14 +54,12 @@ class Listener:
     def send_to(self, cid, message):
         with self.registry_lock:
             connection = self.clients.get(cid)
-        if connection is None:
-            return False
-        if message["type"] in {"FINISH", "BYE"}:
-            with self.registry_lock:
-                if message["type"] == "FINISH":
-                    connection.finish_sent = True
-                else:
-                    connection.bye_sent = True
+            if connection is None:
+                return False
+            if message["type"] == "FINISH":
+                connection.finish_sent = True
+            elif message["type"] == "BYE":
+                connection.bye_sent = True
         return self._send(connection, message)
 
     def _send(self, connection, message):

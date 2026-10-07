@@ -40,7 +40,12 @@ class Decoder:
             self.buffer = bytearray(rest)
             if len(line) > MAX_FRAME:
                 raise ValueError("message too long")
-            obj = json.loads(line.decode("utf-8"))
+            try:
+                obj = json.loads(line.decode("utf-8"))
+            except RecursionError as exc:
+                # Treat excessive nesting like other malformed frames so the
+                # listener can reject this peer without stopping every client.
+                raise ValueError("JSON nesting too deep") from exc
             if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
                 raise ValueError("message must be an object with a type")
             messages.append(obj)

@@ -60,6 +60,27 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual((cid, request["rid"]), (1, 1))
         self.queue.task_done()
 
+    def test_deep_json_unregistered_peer_does_not_kill_listener(self):
+        bad = self.connect()
+        bad.sendall(b'{"type":"HELLO","nested":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}\n')
+        reply = json.loads(bad.makefile("rb").readline())
+        self.assertEqual(reply["type"], "ERROR")
+        self.assertIn("nesting", reply["reason"])
+        self.assertEqual(bad.recv(1), b"")
+        good = self.connect()
+        self.assertEqual(self.hello(good)["type"], "WELCOME")
+        self.assertTrue(self.listener.thread.is_alive())
+        self.assertFalse(self.run.failed.is_set())
+
+    def test_deep_json_registered_peer_fails_run_without_killing_listener(self):
+        bad = self.connect()
+        self.hello(bad)
+        bad.sendall(b'{"type":"REQUEST","nested":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}\n')
+        self.assertEqual(json.loads(bad.makefile("rb").readline())["type"], "ERROR")
+        self.assertTrue(self.run.failed.wait(2))
+        self.assertTrue(self.listener.thread.is_alive())
+        self.assertEqual(self.queue.qsize(), 0)
+
     def test_closed_connection_is_removed_and_send_returns_false(self):
         sock = self.connect()
         self.hello(sock)

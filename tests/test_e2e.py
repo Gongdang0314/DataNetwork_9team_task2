@@ -50,6 +50,29 @@ class EndToEndTests(unittest.TestCase):
                     server.wait()
             self.assertEqual(verify(folder)["status"], "PASS")
             self.assertEqual(verify(folder, submission=True)["status"], "FAIL")
+            # Matching server/client responses must still match the sent command.
+            server_path = folder / "Server.txt"
+            original_server = server_path.read_text(encoding="utf-8")
+            response = next(json.loads(line.split(" | ", 3)[3])
+                            for line in original_server.splitlines()
+                            if json.loads(line.split(" | ", 3)[3]).get("phase") == "response")
+            client_path = folder / f"Client{response['cid']}.txt"
+            original_client = client_path.read_text(encoding="utf-8")
+            for path, original in [(server_path, original_server), (client_path, original_client)]:
+                rows = original.splitlines()
+                for index, line in enumerate(rows):
+                    parts = line.split(" | ", 3)
+                    data = json.loads(parts[3])
+                    if (data.get("phase") == "response" and data.get("rid") == response["rid"]
+                            and (path == client_path or data.get("cid") == response["cid"])):
+                        data["cmd"] = "CANCEL" if response["cmd"] != "CANCEL" else "RESERVE"
+                        rows[index] = " | ".join(parts[:3] + [json.dumps(data)])
+                path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            result = verify(folder)
+            self.assertEqual(result["status"], "FAIL")
+            self.assertTrue(any("request/response command mismatch" in error for error in result["errors"]))
+            server_path.write_text(original_server, encoding="utf-8")
+            client_path.write_text(original_client, encoding="utf-8")
             path = folder / "Server.txt"
             lines = path.read_text(encoding="utf-8").splitlines()
             changed = False

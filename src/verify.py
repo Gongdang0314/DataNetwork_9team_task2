@@ -89,6 +89,8 @@ def verify(folder, submission=False):
                 rid, status = data["rid"], data["status"]
                 if rid not in sent or rid in received:
                     errors.append(f"Client{cid}: unmatched/duplicate response")
+                if data.get("cmd") != sent.get(rid, {}).get("cmd"):
+                    errors.append(f"Client{cid} req={rid}: request/response command mismatch")
                 received.add(rid)
                 response_counts[cid][status] += 1
                 client_response_ms += data["response_ms"]
